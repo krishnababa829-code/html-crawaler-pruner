@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "web2md"
+version = "0.1.0"
+description = "URL-to-Markdown extraction pipeline with HTML pruning, site crawling, and LLM-based content extraction"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "HumpGreenSolutions"},
+]
+
+dependencies = [
+    "httpx>=0.27.0",
+    "beautifulsoup4>=4.12.0",
+    "lxml>=5.1.0",
+    "playwright>=1.40.0",
+    "transformers>=4.44.0",
+    "torch>=2.1.0",
+    "accelerate>=0.30.0",
+    "bitsandbytes>=0.43.0",
+    "sentencepiece>=0.2.0",
+    "click>=8.1.0",
+    "rich>=13.0.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+web2md = "web2md.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
