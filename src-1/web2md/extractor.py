@@ -16,11 +16,15 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+try:
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
 
 from web2md.config import PipelineConfig
 
@@ -61,6 +65,11 @@ class ContentExtractor:
     """LLM-based HTML to Markdown extractor."""
 
     def __init__(self, config: PipelineConfig):
+        if not HAS_TORCH:
+            raise ImportError(
+                "torch and transformers are required for LLM extraction. "
+                "Install with: pip install torch transformers accelerate bitsandbytes sentencepiece"
+            )
         self.config = config
         self._model = None
         self._tokenizer = None
@@ -82,7 +91,10 @@ class ContentExtractor:
             logger.info("Using Apple MPS")
         else:
             self._device = "cpu"
-            logger.info("Using CPU (this will be slow)")
+            logger.warning(
+                "No GPU detected. Running on CPU will be very slow. "
+                "Consider using --skip-llm for fallback extraction."
+            )
 
         # Tokenizer
         token_kwargs = {}
@@ -101,22 +113,29 @@ class ContentExtractor:
         }
 
         if self.config.quantize_4bit and self._device == "cuda":
-            model_kwargs["quantization_config"] = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.float16,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_use_double_quant=True,
-            )
+            try:
+                model_kwargs["quantization_config"] = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.float16,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_use_double_quant=True,
+                )
+                model_kwargs["device_map"] = "auto"
+            except Exception as exc:
+                logger.warning(
+                    "4-bit quantization failed (%s), loading without quantization", exc
+                )
+                model_kwargs["device_map"] = "auto"
+        elif self._device == "cuda":
             model_kwargs["device_map"] = "auto"
-        else:
-            model_kwargs["device_map"] = "auto" if self._device != "cpu" else None
 
         self._model = AutoModelForCausalLM.from_pretrained(
             self.config.model_name,
             **model_kwargs,
         )
 
-        if self._device == "cpu" or (self._device == "mps" and "device_map" not in model_kwargs):
+        # Move to device if not using device_map
+        if "device_map" not in model_kwargs or model_kwargs.get("device_map") is None:
             self._model = self._model.to(self._device)
 
         self._model.eval()
@@ -130,7 +149,7 @@ class ContentExtractor:
         if self._tokenizer is not None:
             del self._tokenizer
             self._tokenizer = None
-        if torch.cuda.is_available():
+        if HAS_TORCH and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
     def _chunk_html(self, html: str) -> list[str]:
@@ -207,10 +226,9 @@ class ContentExtractor:
             max_length=self.config.max_input_tokens,
         )
 
-        if self._device and "device_map" not in str(self._model.hf_device_map if hasattr(self._model, 'hf_device_map') else ""):
-            inputs = {k: v.to(self._model.device) for k, v in inputs.items()}
-        else:
-            inputs = {k: v.to(self._model.device) for k, v in inputs.items()}
+        # Move inputs to model device
+        model_device = next(self._model.parameters()).device
+        inputs = {k: v.to(model_device) for k, v in inputs.items()}
 
         with torch.no_grad():
             outputs = self._model.generate(
