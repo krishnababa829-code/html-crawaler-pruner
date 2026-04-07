@@ -4,19 +4,19 @@ Usage:
     python -m web2md.cli extract <url> [options]
     python -m web2md.cli batch <file> [options]
     python -m web2md.cli prune <input> [options]
+    python -m web2md.cli fetch <url> [options]
 """
 
 from __future__ import annotations
 
 import logging
 import sys
+import traceback
 from pathlib import Path
 
 import click
 from rich.console import Console
 from rich.logging import RichHandler
-
-from web2md.config import PipelineConfig
 
 console = Console()
 
@@ -29,7 +29,32 @@ def _setup_logging(verbose: bool) -> None:
         format="%(message)s",
         datefmt="[%X]",
         handlers=[RichHandler(console=console, rich_tracebacks=True)],
+        force=True,
     )
+
+
+def _check_playwright() -> bool:
+    """Check if Playwright browsers are installed."""
+    try:
+        from playwright.sync_api import sync_playwright
+        pw = sync_playwright().start()
+        try:
+            browser = pw.chromium.launch(headless=True)
+            browser.close()
+        finally:
+            pw.stop()
+        return True
+    except Exception as exc:
+        error_msg = str(exc).lower()
+        if "executable doesn't exist" in error_msg or "browsertype.launch" in error_msg:
+            console.print(
+                "\n[bold red]Playwright browser not installed![/bold red]\n"
+                "Run this command to install it:\n\n"
+                "  [bold cyan]playwright install chromium[/bold cyan]\n"
+            )
+        else:
+            console.print(f"\n[bold red]Playwright check failed:[/bold red] {exc}\n")
+        return False
 
 
 @click.group()
@@ -53,6 +78,10 @@ def main(verbose: bool) -> None:
 @click.option("--no-quantize", is_flag=True, help="Disable 4-bit quantization")
 @click.option("--timeout", "-t", default=30, help="Page load timeout in seconds")
 @click.option("--no-pagination", is_flag=True, help="Don't follow pagination links")
+@click.option(
+    "--skip-llm", is_flag=True,
+    help="Skip LLM extraction, output pruned HTML + fallback text only",
+)
 def extract(
     url: str,
     depth: int,
@@ -63,6 +92,7 @@ def extract(
     no_quantize: bool,
     timeout: int,
     no_pagination: bool,
+    skip_llm: bool,
 ) -> None:
     """Extract content from a URL into Markdown.
 
@@ -70,15 +100,31 @@ def extract(
     crawls linked pages up to --depth, and uses an LLM to produce
     structured Markdown.
 
+    Use --skip-llm to only crawl and prune (no model needed).
+    Use --static to skip browser rendering (faster, but misses JS content).
+
     Examples:
 
         python -m web2md.cli extract "https://example.com"
 
-        python -m web2md.cli extract "https://docs.example.com" --depth 2 --max-pages 100
+        python -m web2md.cli extract "https://example.com" --skip-llm
 
-        python -m web2md.cli extract "https://blog.example.com" --static --model google/gemma-3-4b-it
+        python -m web2md.cli extract "https://example.com" --static
+
+        python -m web2md.cli extract "https://docs.example.com" --depth 2
     """
+    from web2md.config import PipelineConfig
     from web2md.pipeline import run_pipeline
+
+    # Pre-flight check: Playwright installed?
+    if not static:
+        console.print("[dim]Checking Playwright installation...[/dim]")
+        if not _check_playwright():
+            console.print(
+                "[yellow]Tip: Use --static flag to skip browser and use HTTP fetch instead[/yellow]"
+            )
+            sys.exit(1)
+        console.print("[dim]Playwright OK[/dim]")
 
     overrides = {
         "max_depth": depth,
@@ -95,23 +141,26 @@ def extract(
     output_dir = Path(output) if output else None
 
     try:
-        run_pipeline(url, config, static=static, output_dir=output_dir)
+        run_pipeline(
+            url, config, static=static, output_dir=output_dir, skip_llm=skip_llm,
+        )
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted by user[/yellow]")
         sys.exit(1)
     except Exception as exc:
         console.print(f"\n[bold red]Pipeline failed:[/bold red] {exc}")
-        logging.getLogger(__name__).debug("Full traceback:", exc_info=True)
+        console.print(f"\n[dim]{traceback.format_exc()}[/dim]")
         sys.exit(1)
 
 
 @main.command()
-@click.argument("file", type=click.Path(exists=True))
+@click.argument("file", type=click.Path())  # removed exists=True
 @click.option("--output", "-o", type=click.Path(), default=None, help="Output directory")
 @click.option("--depth", "-d", default=1, help="Max crawl depth (default: 1)")
 @click.option("--max-pages", "-n", default=50, help="Max pages per URL (default: 50)")
 @click.option("--static", is_flag=True, help="Use static fetcher")
 @click.option("--model", "-m", default=None, help="HuggingFace model ID")
+@click.option("--skip-llm", is_flag=True, help="Skip LLM, use fallback text extraction")
 def batch(
     file: str,
     output: str | None,
@@ -119,34 +168,61 @@ def batch(
     max_pages: int,
     static: bool,
     model: str | None,
+    skip_llm: bool,
 ) -> None:
     """Process multiple URLs from a file (one URL per line).
+
+    If the file doesn't exist, a template will be created for you.
 
     Example:
 
         python -m web2md.cli batch urls.txt --output ./results/
     """
+    from web2md.config import PipelineConfig
     from web2md.pipeline import run_pipeline
 
-    urls_path = Path(file)
+    urls_path = Path(file).resolve()
+
+    # If file doesn't exist, create a template
+    if not urls_path.exists():
+        urls_path.parent.mkdir(parents=True, exist_ok=True)
+        template = (
+            "# Web-to-Markdown batch URL list\n"
+            "# Add one URL per line. Lines starting with # are ignored.\n"
+            "#\n"
+            "# Example:\n"
+            "# https://docs.pytorch.org/xla/release/r2.8/index.html\n"
+            "# https://example.com/blog\n"
+        )
+        urls_path.write_text(template, encoding="utf-8")
+        console.print(
+            f"[yellow]File not found. Created template at:[/yellow]\n"
+            f"  [bold]{urls_path}[/bold]\n\n"
+            f"Add your URLs (one per line) and run the command again."
+        )
+        sys.exit(0)
+
     urls = [
         line.strip()
-        for line in urls_path.read_text().splitlines()
+        for line in urls_path.read_text(encoding="utf-8").splitlines()
         if line.strip() and not line.strip().startswith("#")
     ]
 
     if not urls:
-        console.print("[red]No URLs found in file[/red]")
+        console.print(
+            f"[red]No URLs found in {urls_path}[/red]\n"
+            f"Add URLs (one per line) and run again."
+        )
         sys.exit(1)
 
-    console.print(f"[bold]Processing {len(urls)} URLs[/bold]")
+    console.print(f"[bold]Processing {len(urls)} URLs from {urls_path}[/bold]")
 
     overrides = {"max_depth": depth, "max_pages": max_pages}
     if model:
         overrides["model_name"] = model
 
     config = PipelineConfig(**overrides)
-    output_dir = Path(output) if output else None
+    output_dir = Path(output).resolve() if output else None
 
     successes = 0
     failures = 0
@@ -157,7 +233,10 @@ def batch(
         console.print(f"[bold]{'='*60}[/bold]")
 
         try:
-            run_pipeline(url, config, static=static, output_dir=output_dir)
+            run_pipeline(
+                url, config, static=static, output_dir=output_dir,
+                skip_llm=skip_llm,
+            )
             successes += 1
         except Exception as exc:
             console.print(f"[red]Failed: {exc}[/red]")
@@ -216,10 +295,18 @@ def fetch_cmd(
 
         python -m web2md.cli fetch "https://example.com" --output raw.html
     """
+    from web2md.config import PipelineConfig
     from web2md.fetcher import create_fetcher
+
+    if not static:
+        if not _check_playwright():
+            console.print("[yellow]Tip: Use --static to skip browser[/yellow]")
+            sys.exit(1)
 
     config = PipelineConfig(timeout=timeout)
     fetcher = create_fetcher(config, static=static)
+
+    console.print(f"[dim]Fetching {url} ({'static' if static else 'dynamic'} mode)...[/dim]")
 
     try:
         fetcher.start()
@@ -232,10 +319,16 @@ def fetch_cmd(
         sys.exit(1)
 
     if output:
-        Path(output).write_text(result.html, encoding="utf-8")
+        out_path = Path(output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(result.html, encoding="utf-8")
         console.print(f"[green]Saved {len(result.html):,} chars to {output}[/green]")
     else:
-        console.print(result.html)
+        # Print first 2000 chars to avoid flooding terminal
+        preview = result.html[:2000]
+        console.print(preview)
+        if len(result.html) > 2000:
+            console.print(f"\n[dim]... ({len(result.html) - 2000:,} more chars, use -o to save full output)[/dim]")
 
     console.print(
         f"\n[dim]Method: {result.method} | Status: {result.status_code} | "
