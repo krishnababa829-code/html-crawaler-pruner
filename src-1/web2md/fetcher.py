@@ -11,18 +11,10 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
-from urllib.parse import urlparse
 
 import httpx
-from playwright.sync_api import (
-    Browser,
-    BrowserContext,
-    Page,
-    sync_playwright,
-    TimeoutError as PlaywrightTimeout,
-)
 
 from web2md.config import PipelineConfig
 
@@ -56,13 +48,16 @@ class DynamicFetcher:
     def __init__(self, config: PipelineConfig):
         self.config = config
         self._playwright = None
-        self._browser: Optional[Browser] = None
-        self._context: Optional[BrowserContext] = None
+        self._browser = None
+        self._context = None
 
     def start(self) -> None:
         """Launch the browser."""
         if self._browser is not None:
             return
+
+        from playwright.sync_api import sync_playwright
+
         self._playwright = sync_playwright().start()
         self._browser = self._playwright.chromium.launch(
             headless=self.config.headless,
@@ -82,23 +77,36 @@ class DynamicFetcher:
     def stop(self) -> None:
         """Shut down the browser."""
         if self._browser:
-            self._browser.close()
+            try:
+                self._browser.close()
+            except Exception:
+                pass
         if self._playwright:
-            self._playwright.stop()
+            try:
+                self._playwright.stop()
+            except Exception:
+                pass
         self._browser = None
         self._context = None
         self._playwright = None
 
     def fetch(self, url: str) -> FetchResult:
         """Fetch a URL with full JS rendering."""
+        from playwright.sync_api import TimeoutError as PlaywrightTimeout
+
         if self._context is None:
             self.start()
 
-        page: Page = self._context.new_page()
+        page = self._context.new_page()
         start_time = time.monotonic()
         error = None
+        html = ""
+        final_url = url
+        status = 0
+        content_type = ""
 
         try:
+            logger.info("Fetching (dynamic): %s", url)
             response = page.goto(
                 url,
                 wait_until="domcontentloaded",
@@ -123,21 +131,23 @@ class DynamicFetcher:
             content_type = (
                 response.headers.get("content-type", "") if response else ""
             )
+            logger.info("Fetched %d chars from %s (status %d)", len(html), final_url, status)
 
         except PlaywrightTimeout:
             error = f"Timeout after {self.config.timeout}s"
-            html = page.content() if page else ""
-            final_url = url
-            status = 0
-            content_type = ""
+            try:
+                html = page.content()
+            except Exception:
+                html = ""
+            logger.warning("Timeout fetching %s", url)
         except Exception as exc:
             error = str(exc)
-            html = ""
-            final_url = url
-            status = 0
-            content_type = ""
+            logger.error("Error fetching %s: %s", url, exc)
         finally:
-            page.close()
+            try:
+                page.close()
+            except Exception:
+                pass
 
         elapsed = (time.monotonic() - start_time) * 1000
 
@@ -152,21 +162,23 @@ class DynamicFetcher:
             error=error,
         )
 
-    def _scroll_to_bottom(self, page: Page, max_scrolls: int = 15) -> None:
+    def _scroll_to_bottom(self, page, max_scrolls: int = 15) -> None:
         """Incrementally scroll to trigger lazy-loaded content."""
+        from playwright.sync_api import TimeoutError as PlaywrightTimeout
+
         previous_height = 0
         for _ in range(max_scrolls):
-            current_height = page.evaluate("document.body.scrollHeight")
-            if current_height == previous_height:
-                break
-            previous_height = current_height
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             try:
+                current_height = page.evaluate("document.body.scrollHeight")
+                if current_height == previous_height:
+                    break
+                previous_height = current_height
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 page.wait_for_timeout(800)
-            except PlaywrightTimeout:
+            except (PlaywrightTimeout, Exception):
                 break
 
-    def _expand_dynamic_content(self, page: Page) -> None:
+    def _expand_dynamic_content(self, page) -> None:
         """Click common expand/show-more buttons and accordion triggers."""
         expand_selectors = [
             "button[aria-expanded='false']",
@@ -240,11 +252,13 @@ class StaticFetcher:
         error = None
 
         try:
+            logger.info("Fetching (static): %s", url)
             resp = self._client.get(url)
             html = resp.text
             final_url = str(resp.url)
             status = resp.status_code
             content_type = resp.headers.get("content-type", "")
+            logger.info("Fetched %d chars from %s (status %d)", len(html), final_url, status)
         except httpx.TimeoutException:
             error = f"Timeout after {self.config.timeout}s"
             html = ""
